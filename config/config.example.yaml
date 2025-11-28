@@ -1,0 +1,41 @@
+telegram:
+  api_id: YOUR_API_ID
+  api_hash: YOUR_API_HASH
+  # Каналы для скачивания (можно указать username, invite link или ID)
+  channels:
+    - "https://t.me/joinchat/AAAAAFZTTF99JzOWLZH74A"
+    # Примеры других форматов:
+    # - "@channel_name"
+    # - -1001234567890
+
+download:
+  # Количество одновременных загрузок
+  max_concurrent: 5
+  # Путь для сохранения файлов
+  download_path: "./downloads"
+  # Количество попыток при ошибке
+  retry_attempts: 3
+  # Задержка между попытками (секунды)
+  retry_delay: 5
+  # Качества видео для скачивания (360, 480, 720)
+  video_qualities: [360, 480, 720]
+  # Если доступное качество не совпадает с указанными, скачать ближайшее меньшее?
+  download_nearest_quality: true
+
+notifications:
+  enabled: true
+  bot_token: YOUR_BOT_TOKEN
+  chat_id: YOUR_CHAT_ID
+  # Уведомлять при завершении всех загрузок
+  notify_on_completion: true
+  # Уведомлять при критических ошибках
+  notify_on_errors: true
+  # Уведомлять при начале загрузки
+  notify_on_start: false
+
+logging:
+  # Уровень логирования: DEBUG, INFO, WARNING, ERROR
+  level: INFO
+  # Путь к файлу логов
+  log_file: "./logs/downloader.log"
+
