@@ -3,40 +3,33 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
+.installed.cfg
 
-# Telegram sessions
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Telegram sessions (содержат личные данные авторизации)
 sessions/
 *.session
 *.session-journal
 
-# Configuration
+# Конфигурация с реальными API ключами (не коммитить!)
 config/config.yaml
 .env
+.env.local
 
-# Data
+# Скачанные файлы (могут быть большими)
+downloads/
+
+# Метаданные скачанных файлов
 data/
-*.json
 
-# Logs
+# Логи
 logs/
 *.log
 
@@ -50,4 +43,9 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
+# Build и distribution
+build/
+dist/
+*.egg-info/

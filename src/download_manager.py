@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import time
+import re
 from typing import List, Optional, Callable, Dict
 from pathlib import Path
 from tqdm.asyncio import tqdm
@@ -191,6 +192,45 @@ class DownloadManager:
             logger.debug(f"Ошибка при скачивании постера: {e}")
             return False
 
+    async def _download_additional_photos(self, photo_messages: List[Message], series_folder: Path, client) -> int:
+        """
+        Скачивание всех дополнительных фото, связанных с серией.
+
+        Args:
+            photo_messages: Список сообщений с фотографиями
+            series_folder: Папка серии
+            client: Telegram клиент
+
+        Returns:
+            Количество успешно скачанных фото
+        """
+        downloaded_count = 0
+        index = 1
+
+        for msg in photo_messages:
+            try:
+                if not msg.media or not isinstance(msg.media, MessageMediaPhoto):
+                    continue
+
+                photo_file = series_folder / f"image_{index}.jpg"
+
+                # Не перезаписываем уже существующие файлы
+                if photo_file.exists() and photo_file.stat().st_size > 0:
+                    index += 1
+                    continue
+
+                await client.download_media(msg.media, file=str(photo_file))
+
+                if photo_file.exists() and photo_file.stat().st_size > 0:
+                    downloaded_count += 1
+                    index += 1
+                    logger.debug(f"Скачано дополнительное фото: {photo_file}")
+            except Exception as e:
+                logger.debug(f"Ошибка при скачивании дополнительного фото: {e}")
+                continue
+
+        return downloaded_count
+
     async def download_video(
         self,
         message: Message,
@@ -253,6 +293,11 @@ class DownloadManager:
         poster_file = series_folder / "poster.jpg"
         if not poster_file.exists():
             await self._download_poster(message, series_folder, self.client)
+
+        # Скачиваем все дополнительные фото из того же альбома/поста, если они есть
+        album_photos = getattr(message, "_album_photos", None)
+        if album_photos:
+            await self._download_additional_photos(album_photos, series_folder, self.client)
         
         # Определяем имя файла в новом формате: название.качество.mp4
         file_name = self._get_file_name(series_name, quality)
@@ -260,12 +305,53 @@ class DownloadManager:
 
         # Проверяем, не скачан ли уже файл этого качества
         if file_path.exists():
-            logger.debug(f"Файл {file_name} уже существует, пропускаем")
-            self.skipped_count += 1
-            return False
+            # Проверяем размер файла - если он неполный, удаляем и начинаем заново
+            file_size = file_path.stat().st_size
+            expected_size = document.size if hasattr(document, 'size') else 0
+            
+            if expected_size > 0 and file_size < expected_size:
+                # Файл неполный - удаляем и начинаем заново
+                logger.warning(
+                    f"Файл {file_name} неполный ({self.file_handler.format_file_size(file_size)} "
+                    f"из {self.file_handler.format_file_size(expected_size)}), удаляем и начинаем заново"
+                )
+                # Пытаемся удалить файл с обработкой ошибок
+                try:
+                    file_path.unlink()
+                except PermissionError as e:
+                    # Файл занят другим процессом - пропускаем этот файл
+                    logger.warning(
+                        f"Не удалось удалить файл {file_name}: файл занят другим процессом. "
+                        f"Пропускаем загрузку."
+                    )
+                    self.skipped_count += 1
+                    return False
+                except OSError as e:
+                    # Другие ошибки файловой системы
+                    logger.warning(
+                        f"Не удалось удалить файл {file_name}: {e}. Пропускаем загрузку."
+                    )
+                    self.skipped_count += 1
+                    return False
+            else:
+                # Файл полный - пропускаем
+                logger.debug(f"Файл {file_name} уже существует и полный, пропускаем")
+                self.skipped_count += 1
+                return False
 
         # Получаем размер файла для прогресс-бара
         total_size = document.size if hasattr(document, 'size') else 0
+        
+        # Сохраняем метаданные СРАЗУ после начала загрузки, чтобы можно было продолжить
+        # при следующем запуске, даже если загрузка прервется
+        self.file_handler.mark_file_as_downloading(
+            message_id,
+            channel_name,
+            str(file_path),
+            total_size,
+            quality
+        )
+        logger.debug(f"Начата загрузка {file_name}, метаданные сохранены")
         
         # Создаем callback для прогресса, если не передан
         if progress_callback is None:
@@ -274,6 +360,16 @@ class DownloadManager:
         # Пробуем загрузить с повторными попытками
         for attempt in range(self.retry_attempts):
             try:
+                # Проверяем подключение перед попыткой скачивания
+                if not self.client.is_connected():
+                    logger.warning(f"Клиент отключен, пропускаем загрузку {message_id}")
+                    # Закрываем прогресс-бар
+                    if message_id in self.active_progress_bars:
+                        self.active_progress_bars[message_id].close()
+                        del self.active_progress_bars[message_id]
+                    self.failed_count += 1
+                    return False
+                
                 # Загружаем файл
                 await self.client.download_media(
                     message,
@@ -313,6 +409,17 @@ class DownloadManager:
                 continue
 
             except Exception as e:
+                # Проверяем, является ли это ошибкой отключения
+                error_str = str(e).lower()
+                if 'disconnected' in error_str or 'cannot send requests' in error_str:
+                    # Ошибка подключения - клиент отключен
+                    logger.warning(f"Клиент отключен при загрузке {message_id}: {e}")
+                    # Закрываем прогресс-бар
+                    if message_id in self.active_progress_bars:
+                        self.active_progress_bars[message_id].close()
+                        del self.active_progress_bars[message_id]
+                    self.failed_count += 1
+                    return False
                 # Закрываем прогресс-бар при ошибке
                 if message_id in self.active_progress_bars:
                     self.active_progress_bars[message_id].close()
@@ -352,34 +459,108 @@ class DownloadManager:
         
         return filename
 
+    def _extract_title_from_text(self, text: str) -> str:
+        """
+        Выделяет «чистое» название тайтла из текста поста.
+
+        Пример: из "Моя сестра - 1 серия 480p" получаем "Моя сестра".
+        """
+        # Берем только первую строку — обычно там заголовок
+        text = text.split('\n', 1)[0]
+        text = text.replace('\r', ' ').strip()
+
+        # Если есть конструкция "Название - 1 серия", "Название — 1 и 2 серии" и т.п.,
+        # то берем только левую часть до дефиса, если справа явно речь о сериях
+        parts = re.split(r'\s[-—–]\s', text, maxsplit=1)
+        if len(parts) == 2:
+            left, right = parts
+            right_lower = right.lower()
+            if any(keyword in right_lower for keyword in ['серия', 'серии', 'эпизод', 'episode', 'ep']):
+                text = left.strip()
+
+        # Часто пишут русское и английское название через слэш:
+        # "Рейка — ... / Reika wa ... - 1 и 2 серии"
+        # Логика:
+        # - если оба названия помещаются в лимит — оставляем оба: "Русское / English"
+        # - если суммарно слишком длинно — режем русское и оставляем только English
+        slash_parts = re.split(r'\s*/\s*', text, maxsplit=1)
+        if len(slash_parts) == 2:
+            left_part = slash_parts[0].strip()
+            right_part = slash_parts[1].strip()
+            # Максимальная длина итогового заголовка
+            max_len = 150
+            if left_part and right_part:
+                both = f"{left_part} / {right_part}"
+                if len(both) <= max_len:
+                    text = both
+                else:
+                    # Обрезаем русскую часть — используем только английское название
+                    text = right_part
+
+        # Убираем любые хвосты с номерами серий/эпизодов и качеством
+        patterns_to_strip = [
+            r'\b\d+\s*сер(ия|ии)\b',
+            r'\bсер(ия|ии)\s*\d+(\s*[-–]\s*\d+)?\b',
+            r'\b\d+\s*эп(изод)?\b',
+            r'\bэп(изод)?\s*\d+(\s*[-–]\s*\d+)?\b',
+            r'\b\d{3,4}p\b',
+            r'\bfull\s*hd\b',
+            r'\bhd\b',
+        ]
+        cleaned = text
+        for pattern in patterns_to_strip:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+
+        # Удаляем лишние пробелы/дефисы/точки/запятые в конце
+        cleaned = re.sub(r'[\s\-–—\.\,]+$', '', cleaned).strip()
+
+        # Ограничиваем длину, чтобы не делать слишком длинные пути
+        return cleaned[:150].strip() or text[:150].strip()
+
     def _get_series_name(self, message: Message) -> str:
         """
         Получение названия серии из сообщения.
 
         Приоритет:
-        1. Текст сообщения (если есть)
+        1. Текст поста (именно он определяет название тайтла)
+           - проверяем текст в самом сообщении с видео
+           - если видео в альбоме, проверяем текст во всех сообщениях альбома
         2. Имя из атрибутов документа
         3. ID сообщения
-
-        Args:
-            message: Сообщение с видео
-
-        Returns:
-            Название серии
         """
         series_name = None
-        
-        # Приоритет 1: Пробуем получить название из текста сообщения
+
+        # Приоритет 1: пробуем взять название из текста поста
+        # Сначала проверяем текст в самом сообщении с видео
         if hasattr(message, 'message') and message.message:
-            text = message.message.strip()
-            if text:
-                # Очищаем текст от лишних символов
-                text = text.replace('\n', ' ').replace('\r', ' ')
-                # Берем первые 150 символов (чтобы не было слишком длинно)
-                series_name = text[:150].strip()
-                logger.debug(f"Использован текст сообщения для названия: {series_name[:50]}...")
+            raw_text = message.message.strip()
+            if raw_text:
+                title = self._extract_title_from_text(raw_text)
+                if title:
+                    series_name = title
+                    logger.debug(
+                        f"Использован текст сообщения для названия: {series_name[:50]}..."
+                    )
         
-        # Приоритет 2: Пробуем получить имя из документа
+        # Если не нашли текст в сообщении с видео, проверяем все сообщения альбома
+        # (в Telegram текст поста часто находится в первом сообщении альбома)
+        if not series_name:
+            album_messages = getattr(message, "_album_messages", None)
+            if album_messages:
+                # Проверяем все сообщения альбома, начиная с первого (там обычно текст)
+                for album_msg in album_messages:
+                    if hasattr(album_msg, 'message') and album_msg.message:
+                        raw_text = album_msg.message.strip()
+                        if raw_text:
+                            title = self._extract_title_from_text(raw_text)
+                            if title:
+                                series_name = title
+                                logger.debug(
+                                    f"Использован текст из альбома для названия: {series_name[:50]}..."
+                                )
+                                break
+
+        # Приоритет 2: fallback к имени файла документа (только если это не просто "серия 1" и т.п.)
         if not series_name and message.media and hasattr(message.media, 'document'):
             doc = message.media.document
             if doc and hasattr(doc, 'attributes'):
@@ -387,18 +568,33 @@ class DownloadManager:
                     if hasattr(attr, 'file_name') and attr.file_name:
                         # Убираем расширение
                         name_parts = attr.file_name.rsplit('.', 1)
-                        series_name = name_parts[0]
-                        logger.debug(f"Использовано имя из документа: {series_name}")
-                        break
-        
-        # Приоритет 3: Генерируем по ID сообщения
+                        file_name_without_ext = name_parts[0]
+                        
+                        # Проверяем, что имя файла не является просто номером серии
+                        # (например, "1 серия", "серия 1", "1.480p" и т.п.)
+                        file_name_lower = file_name_without_ext.lower()
+                        # Если имя файла содержит только цифры, "серия", "серии", "эпизод" и качество - пропускаем
+                        is_just_episode = (
+                            re.match(r'^[\d\s\-\.]*$', file_name_without_ext) or  # только цифры и разделители
+                            re.match(r'^[\d\s]*сер(ия|ии)[\d\s]*$', file_name_lower) or  # "1 серия", "серия 1"
+                            re.match(r'^[\d\s]*эп(изод)?[\d\s]*$', file_name_lower) or  # "1 эпизод"
+                            re.match(r'^[\d\s]*p$', file_name_lower) or  # "480p", "720p"
+                            len(file_name_without_ext.strip()) < 3  # слишком короткое имя
+                        )
+                        
+                        if not is_just_episode:
+                            series_name = file_name_without_ext
+                            logger.debug(f"Использовано имя из документа: {series_name}")
+                            break
+
+        # Приоритет 3: если вообще ничего нет — используем ID сообщения
         if not series_name:
             series_name = f"video_{message.id}"
             logger.debug(f"Использован ID сообщения для названия: {series_name}")
-        
+
         # Очищаем имя от недопустимых символов
         series_name = self._sanitize_filename(series_name)
-        
+
         return series_name
 
     def _get_file_name(self, series_name: str, quality: Optional[int] = None) -> str:
@@ -463,7 +659,14 @@ class DownloadManager:
 
         # Запускаем все загрузки
         tasks = [download_with_semaphore(msg) for msg in messages]
-        await asyncio.gather(*tasks)
+        # Используем return_exceptions=True, чтобы все задачи завершились,
+        # даже если некоторые упали с ошибкой
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Логируем исключения, если они были
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Ошибка при загрузке сообщения {messages[i].id}: {result}")
         
         pbar.close()
 

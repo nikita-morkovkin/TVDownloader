@@ -99,30 +99,56 @@ class FileHandler:
             channel_name: Имя канала
 
         Returns:
-            True если файл уже скачан
+            True если файл уже скачан и существует на диске
         """
         channel_key = channel_name
         if channel_key not in self.metadata:
             return False
 
-        return str(message_id) in self.metadata[channel_key].get('messages', {})
+        message_key = str(message_id)
+        message_data = self.metadata[channel_key].get('messages', {}).get(message_key)
+        if not message_data:
+            return False
 
-    def mark_file_as_downloaded(
+        # Проверяем, существует ли файл на диске и его размер совпадает
+        file_path = message_data.get('file_path')
+        expected_size = message_data.get('file_size', 0)
+        
+        if file_path:
+            file = Path(file_path)
+            if file.exists():
+                actual_size = file.stat().st_size
+                # Если размер совпадает (или файл больше ожидаемого - возможно обновлен),
+                # считаем что файл скачан
+                if actual_size >= expected_size and expected_size > 0:
+                    return True
+                # Если файл существует, но размер меньше ожидаемого - файл неполный,
+                # нужно перезагрузить
+                elif actual_size < expected_size:
+                    logger.debug(
+                        f"Файл {file_path} неполный: {actual_size} < {expected_size}, "
+                        f"будет перезагружен"
+                    )
+                    return False
+
+        return False
+
+    def mark_file_as_downloading(
         self,
         message_id: int,
         channel_name: str,
         file_path: str,
-        file_size: int,
+        expected_size: int,
         quality: Optional[int] = None
     ):
         """
-        Отметка файла как скачанного.
+        Отметка файла как начатого к загрузке (сохраняет метаданные сразу).
 
         Args:
             message_id: ID сообщения
             channel_name: Имя канала
             file_path: Путь к файлу
-            file_size: Размер файла
+            expected_size: Ожидаемый размер файла
             quality: Качество видео (опционально)
         """
         channel_key = channel_name
@@ -136,18 +162,79 @@ class FileHandler:
             }
 
         message_key = str(message_id)
-        if message_key not in self.metadata[channel_key]['messages']:
-            self.metadata[channel_key]['total_files'] += 1
-            self.metadata[channel_key]['total_size'] += file_size
-
+        is_new = message_key not in self.metadata[channel_key]['messages']
+        
+        # Сохраняем метаданные с пометкой "в процессе"
         self.metadata[channel_key]['messages'][message_key] = {
             'file_path': file_path,
-            'file_size': file_size,
+            'file_size': expected_size,  # Ожидаемый размер
             'quality': quality,
+            'status': 'downloading',  # Статус: в процессе загрузки
+            'started_at': datetime.now().isoformat()
+        }
+        
+        # Обновляем статистику только для новых файлов
+        if is_new:
+            self.metadata[channel_key]['total_files'] += 1
+        
+        self.metadata[channel_key]['last_updated'] = datetime.now().isoformat()
+        self._save_metadata()
+
+    def mark_file_as_downloaded(
+        self,
+        message_id: int,
+        channel_name: str,
+        file_path: str,
+        file_size: int,
+        quality: Optional[int] = None
+    ):
+        """
+        Отметка файла как полностью скачанного.
+
+        Args:
+            message_id: ID сообщения
+            channel_name: Имя канала
+            file_path: Путь к файлу
+            file_size: Реальный размер файла
+            quality: Качество видео (опционально)
+        """
+        channel_key = channel_name
+        if channel_key not in self.metadata:
+            self.metadata[channel_key] = {
+                'channel_name': channel_name,
+                'messages': {},
+                'total_files': 0,
+                'total_size': 0,
+                'last_updated': None
+            }
+
+        message_key = str(message_id)
+        is_new = message_key not in self.metadata[channel_key]['messages']
+        
+        # Обновляем метаданные - файл полностью скачан
+        old_data = self.metadata[channel_key]['messages'].get(message_key, {})
+        old_size = old_data.get('file_size', 0)
+        
+        self.metadata[channel_key]['messages'][message_key] = {
+            'file_path': file_path,
+            'file_size': file_size,  # Реальный размер
+            'quality': quality,
+            'status': 'completed',  # Статус: завершено
             'downloaded_at': datetime.now().isoformat()
         }
-        self.metadata[channel_key]['last_updated'] = datetime.now().isoformat()
         
+        # Обновляем статистику
+        if is_new:
+            self.metadata[channel_key]['total_files'] += 1
+            self.metadata[channel_key]['total_size'] += file_size
+        else:
+            # Если файл был в процессе загрузки, обновляем размер
+            if old_size != file_size:
+                self.metadata[channel_key]['total_size'] = (
+                    self.metadata[channel_key]['total_size'] - old_size + file_size
+                )
+        
+        self.metadata[channel_key]['last_updated'] = datetime.now().isoformat()
         self._save_metadata()
 
     def get_download_statistics(self) -> Dict:

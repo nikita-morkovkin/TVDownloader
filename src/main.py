@@ -201,12 +201,14 @@ async def main():
                 )
 
             except Exception as e:
-                logger.error(f"Ошибка при обработке канала {channel_identifier}: {e}")
+                logger.error(f"Ошибка при обработке канала {channel_identifier}: {e}", exc_info=True)
+                # Продолжаем обработку других каналов даже при ошибке
                 if notifier and notifications_config.get('notify_on_errors', False):
                     try:
                         await notifier.notify_error(f"Ошибка в канале {channel_identifier}: {str(e)}")
                     except Exception as notify_error:
                         logger.warning(f"Не удалось отправить уведомление об ошибке: {notify_error}")
+                continue
 
         # Форматируем общую статистику
         total_stats['total_size_formatted'] = file_handler.format_file_size(total_stats['total_size'])

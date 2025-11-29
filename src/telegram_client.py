@@ -4,9 +4,9 @@ Telegram клиент для подключения к API и получения
 import asyncio
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 from telethon import TelegramClient
-from telethon.tl.types import Message, MessageMediaDocument, DocumentAttributeVideo
+from telethon.tl.types import Message, MessageMediaDocument, DocumentAttributeVideo, MessageMediaPhoto
 from telethon.errors import ChannelPrivateError, UsernameNotOccupiedError
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,15 @@ class TelegramClientWrapper:
             await self.client.disconnect()
             self._connected = False
             logger.info("Отключено от Telegram")
+
+    def is_connected(self) -> bool:
+        """
+        Проверка, подключен ли клиент к Telegram.
+        
+        Returns:
+            True если подключен, False иначе
+        """
+        return self._connected and self.client.is_connected()
 
     async def get_channel_entity(self, channel_identifier: str):
         """
@@ -103,14 +112,42 @@ class TelegramClientWrapper:
         if not entity:
             return []
 
-        video_messages = []
+        video_messages: List[Message] = []
+        media_groups: Dict[int, List[Message]] = {}
+
         try:
             async for message in self.client.iter_messages(entity, limit=limit):
+                # Собираем сообщения по медиагруппам (альбомам)
+                grouped_id = getattr(message, "grouped_id", None)
+                if grouped_id is not None:
+                    media_groups.setdefault(grouped_id, []).append(message)
+
+                # Отбираем только сообщения с видео
                 if self._is_video_message(message):
                     video_messages.append(message)
                     logger.debug(f"Найдено видео: {message.id} из канала {channel_identifier}")
         except Exception as e:
             logger.error(f"Ошибка при получении сообщений из {channel_identifier}: {e}")
+
+        # Для каждого видео, которое входит в альбом, прикрепляем связанные фото и все сообщения альбома
+        for video_msg in video_messages:
+            grouped_id = getattr(video_msg, "grouped_id", None)
+            if grouped_id is None:
+                continue
+
+            group_messages = media_groups.get(grouped_id, [])
+            album_photos = [
+                msg for msg in group_messages
+                if isinstance(msg.media, MessageMediaPhoto)
+            ]
+            if album_photos:
+                # Сохраняем связанные фото прямо в объекте сообщения,
+                # чтобы использовать их позже в DownloadManager
+                setattr(video_msg, "_album_photos", album_photos)
+            
+            # Сохраняем все сообщения альбома, чтобы можно было найти текст поста
+            # (текст часто находится в первом сообщении альбома, а не в сообщении с видео)
+            setattr(video_msg, "_album_messages", group_messages)
 
         logger.info(f"Найдено {len(video_messages)} видео в канале {channel_identifier}")
         return video_messages
